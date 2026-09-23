@@ -1,0 +1,15 @@
+# pbseed -> R2 replica. Secrets stay in env (litestream expands ${VAR}).
+# Single writer only (see entrypoint.sh). Covers data.db: users, sessions,
+# settings, notes. RPO ~1s; an idle DB costs ~zero R2 ops (syncs on change).
+access-key-id: ${R2_ACCESS_KEY_ID}
+secret-access-key: ${R2_SECRET_ACCESS_KEY}
+
+dbs:
+  - path: /pb/pb_data/data.db
+    replicas:
+      - type: s3
+        bucket: ${R2_BUCKET}
+        path: pbseed
+        endpoint: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+        region: auto
+        sync-interval: 1s

@@ -1,0 +1,1167 @@
+package main
+
+import (
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/security"
+	"github.com/pocketbase/pocketbase/tools/types"
+)
+
+// Seed(ed25519) auth — Go port of the JS PoC + the ftugit/test scheme:
+// challenge -> signature -> login (short-lived access + long-lived session
+// cookie). Every users-token request must also carry a live session cookie.
+//
+// Ported from the original SurrealDB scheme (server/install/database/01_auth.surql):
+//   - ban (banned/ban_reason/banned_until) checked on login, renew AND every
+//     request (middleware), with lazy expiry and no scheduler;
+//   - IP check on renew: per-user strict_ip kills the session on change,
+//     otherwise the old mask+country go to the session history (cap 10);
+//   - logout (current device) and logout-all;
+//   - sessions listing carries ip_masked, country, history and a `current` flag.
+//
+// Deliberate deviations from the original are marked with [spec] (user's
+// explicit spec wins) or [pb] (PocketBase has no equivalent mechanism).
+
+const (
+	seedMsgPrefix  = "surreal-auth-v1:"
+	seedCookieName = "pb_seed"
+
+	seedChallengeTTL = 5 * time.Minute
+	seedSessionDays  = 30
+
+	// Informational: the real access-token TTL comes from the users
+	// collection authToken.duration, patched to this value in bootstrap.
+	seedAccessTTL = 900
+
+	// Max ip_changed entries kept per session (original: array::slice(-10)).
+	seedHistoryCap = 10
+)
+
+var (
+	rxHex64  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	rxHex128 = regexp.MustCompile(`^[0-9a-f]{128}$`)
+)
+
+// ---------------------------------------------------------------- helpers
+
+func nowISO() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+func isoExpired(raw any) bool {
+	s, _ := raw.(string)
+	if s == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		if t, err = time.Parse(time.RFC3339, s); err != nil {
+			return true
+		}
+	}
+	return !t.After(time.Now())
+}
+
+func asStr(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func asBool(v any) bool {
+	b, _ := v.(bool)
+	return b
+}
+
+func truncRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:n])
+}
+
+// maskIP mirrors fn::mask_ip: "85.76.130.44" -> "85.76.*.*",
+// IPv6 -> first 3 groups + "::*".
+func maskIP(ip string) string {
+	if ip == "" {
+		return ""
+	}
+	if strings.Contains(ip, ":") {
+		parts := strings.Split(ip, ":")
+		if len(parts) < 3 {
+			return ip + "::*"
+		}
+		return strings.Join(parts[:3], ":") + "::*"
+	}
+	o := strings.Split(ip, ".")
+	if len(o) == 4 {
+		return o[0] + "." + o[1] + ".*.*"
+	}
+	return "*.*.*.*"
+}
+
+// geoCountry lives in geo.go (stage 2: local MaxMind-DB lookup, "" when
+// no DB is loaded yet).
+
+func cookieVal(e *core.RequestEvent, name string) string {
+	c, err := e.Request.Cookie(name)
+	if err != nil || c == nil {
+		return ""
+	}
+	return c.Value
+}
+
+// seedCookieSecure reports whether to mark the session cookie Secure.
+// Default ON (prod is HTTPS); local plain-HTTP browser dev opts out with
+// PB_COOKIE_INSECURE=1 (API clients like the test suite are unaffected).
+func seedCookieSecure() bool { return os.Getenv("PB_COOKIE_INSECURE") != "1" }
+
+func setSeedCookie(e *core.RequestEvent, value string, maxAge int) {
+	e.SetCookie(&http.Cookie{
+		Name:     seedCookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   seedCookieSecure(),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+}
+
+func clearSeedCookie(e *core.RequestEvent) {
+	setSeedCookie(e, "", -1)
+}
+
+func seedErr(e *core.RequestEvent, status int, code string) error {
+	return e.JSON(status, map[string]any{"error": code})
+}
+
+// --- ban ---------------------------------------------------------------
+// Original: disabled + block_reason + block_until ("" = forever), expiry
+// checked lazily, no scheduler. Ported 1:1, field names adapted to PB style.
+
+func userBanned(user *core.Record) bool {
+	if user == nil || !asBool(user.Get("banned")) {
+		return false
+	}
+	until := asStr(user.Get("banned_until"))
+	if until == "" {
+		return true // empty term = forever
+	}
+	return !isoExpired(until)
+}
+
+func banErr(e *core.RequestEvent, user *core.Record) error {
+	out := map[string]any{"error": "banned"}
+	if r := asStr(user.Get("ban_reason")); r != "" {
+		out["reason"] = r
+	}
+	return e.JSON(403, out)
+}
+
+// --- session history ----------------------------------------------------
+// Original: metadata.history = [{event, prev_masked, at}], append-only,
+// capped at 10 (newest kept). Port adds prev_country (spec: "старая маска
+// и страна записывается в историю").
+
+func getHistory(sess *core.Record) []any {
+	switch v := sess.Get("history").(type) {
+	case []any:
+		if v != nil {
+			return v
+		}
+	case types.JSONRaw: // what PB actually returns for JSON fields
+		var out []any
+		if len(v) > 0 {
+			_ = json.Unmarshal(v, &out)
+		}
+		if out != nil {
+			return out
+		}
+	case string:
+		var out []any
+		if v != "" {
+			_ = json.Unmarshal([]byte(v), &out)
+		}
+		if out != nil {
+			return out
+		}
+	case []byte:
+		var out []any
+		if len(v) > 0 {
+			_ = json.Unmarshal(v, &out)
+		}
+		if out != nil {
+			return out
+		}
+	}
+	return []any{}
+}
+
+func pushHistory(sess *core.Record, entry map[string]any) {
+	h := append(getHistory(sess), entry)
+	if len(h) > seedHistoryCap {
+		h = h[len(h)-seedHistoryCap:]
+	}
+	sess.Set("history", h)
+}
+
+// adoptIP records the current socket IP on the session (hash + masked +
+// country). Raw IP is never stored, same as the original.
+func adoptIP(sess *core.Record, grant, ip string) {
+	sess.Set("ip_hash", security.SHA256(ip+"|"+grant))
+	sess.Set("ip_masked", maskIP(ip))
+	sess.Set("ip_country", geoCountry(ip))
+}
+
+// --- policy (kick on IP change) ------------------------------------------
+// fss port (04_settings.surql): options table {key, value, user?, locked}.
+// Resolution: personal row (user) -> global row (user empty) -> false.
+// A locked global row forbids users from (re)creating a personal override;
+// the superuser is unrestricted. Fail-open (false) on any error, like the
+// original's tolerance for a missing settings table.
+
+const seedPolicyKick = "kick_on_ip_change"
+
+func findSetting(app core.App, key, userId string) *core.Record {
+	rows, err := app.FindRecordsByFilter("seed_settings", "key = '"+key+"'", "", 100, 0)
+	if err != nil {
+		return nil
+	}
+	for _, r := range rows {
+		if asStr(r.Get("user")) == userId {
+			return r
+		}
+	}
+	return nil
+}
+
+// seedPolicy resolves the effective value + source ("me"|"global"|"default").
+func seedPolicy(app core.App, userId, key string) (bool, string) {
+	if userId != "" {
+		if r := findSetting(app, key, userId); r != nil {
+			return asBool(r.Get("value")), "me"
+		}
+	}
+	if r := findSetting(app, key, ""); r != nil {
+		return asBool(r.Get("value")), "global"
+	}
+	return false, "default"
+}
+
+var rxPolicyKey = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
+// GET /api/seed/policy?key=K&scope=me|global -> {key, value, source}
+// Scope defaults: user -> me, guest/superuser -> global.
+func seedPolicyGet(e *core.RequestEvent) error {
+	key := strings.TrimSpace(e.Request.URL.Query().Get("key"))
+	if key == "" {
+		key = seedPolicyKick
+	}
+	if !rxPolicyKey.MatchString(key) {
+		return seedErr(e, 400, "bad_key")
+	}
+	scope := strings.ToLower(strings.TrimSpace(e.Request.URL.Query().Get("scope")))
+	a := e.Auth
+	if a == nil || a.IsSuperuser() {
+		if scope == "" {
+			scope = "global"
+		}
+		if scope != "global" {
+			return seedErr(e, 400, "bad_scope")
+		}
+		v, src := seedPolicy(e.App, "", key)
+		return e.JSON(200, map[string]any{"key": key, "value": v, "source": src})
+	}
+	if scope == "" {
+		scope = "me"
+	}
+	if scope != "me" && scope != "global" {
+		return seedErr(e, 400, "bad_scope")
+	}
+	uid := ""
+	if scope == "me" {
+		uid = a.Id
+	}
+	v, src := seedPolicy(e.App, uid, key)
+	return e.JSON(200, map[string]any{"key": key, "value": v, "source": src})
+}
+
+// POST /api/seed/policy {key, value, scope?, locked?}
+// scope=me (users, default): upsert own row; a locked global forbids NEW
+// rows (updating your existing row stays allowed, like fss).
+// scope=global (superuser only): upsert the default row (+optional locked flag).
+func seedPolicySet(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return seedErr(e, 401, "auth_required")
+	}
+	var b struct {
+		Key    string `json:"key"`
+		Value  *bool  `json:"value"`
+		Scope  string `json:"scope"`
+		Locked *bool  `json:"locked"`
+	}
+	_ = e.BindBody(&b)
+	key := strings.TrimSpace(b.Key)
+	if key == "" {
+		key = seedPolicyKick
+	}
+	if !rxPolicyKey.MatchString(key) {
+		return seedErr(e, 400, "bad_key")
+	}
+	if b.Value == nil {
+		return seedErr(e, 400, "bad_value")
+	}
+	scope := strings.ToLower(strings.TrimSpace(b.Scope))
+	isSU := e.Auth.IsSuperuser()
+	if scope == "" {
+		if isSU {
+			scope = "global"
+		} else {
+			scope = "me"
+		}
+	}
+	if scope != "me" && scope != "global" {
+		return seedErr(e, 400, "bad_scope")
+	}
+	if scope == "global" && !isSU {
+		return seedErr(e, 403, "forbidden")
+	}
+	if scope == "me" && isSU {
+		return seedErr(e, 400, "bad_scope")
+	}
+
+	uid := ""
+	if scope == "me" {
+		uid = e.Auth.Id
+	}
+	if r := findSetting(e.App, key, uid); r != nil {
+		// Updating your own row is allowed even under a locked global —
+		// fss guards CREATE (and user reassignment), not value updates.
+		r.Set("value", *b.Value)
+		if scope == "global" && b.Locked != nil {
+			r.Set("locked", *b.Locked)
+		}
+		if scope == "me" {
+			r.Set("locked", false)
+		}
+		if err := e.App.Save(r); err != nil {
+			return seedErr(e, 500, "store_failed")
+		}
+		return e.JSON(200, map[string]any{"key": key, "value": *b.Value, "scope": scope})
+	}
+	// Create path: a locked global row forbids NEW personal overrides.
+	if scope == "me" {
+		if g := findSetting(e.App, key, ""); g != nil && asBool(g.Get("locked")) {
+			return seedErr(e, 403, "locked")
+		}
+	}
+	col, err := e.App.FindCollectionByNameOrId("seed_settings")
+	if err != nil {
+		return seedErr(e, 500, "no_store")
+	}
+	rec := core.NewRecord(col)
+	rec.Set("key", key)
+	rec.Set("value", *b.Value)
+	if uid != "" {
+		rec.Set("user", uid)
+		rec.Set("locked", false)
+	} else if b.Locked != nil {
+		rec.Set("locked", *b.Locked)
+	}
+	if err := e.App.Save(rec); err != nil {
+		// Lost a create race: re-read and update instead.
+		if r := findSetting(e.App, key, uid); r != nil {
+			r.Set("value", *b.Value)
+			if scope == "global" && b.Locked != nil {
+				r.Set("locked", *b.Locked)
+			}
+			if err2 := e.App.Save(r); err2 == nil {
+				return e.JSON(200, map[string]any{"key": key, "value": *b.Value, "scope": scope})
+			}
+		}
+		return seedErr(e, 500, "store_failed")
+	}
+	return e.JSON(200, map[string]any{"key": key, "value": *b.Value, "scope": scope})
+}
+
+// DELETE /api/seed/policy?key=K&scope=me|global -> {ok, deleted}
+// Removes the personal override (falls back to global) or the global row.
+// Deleting is always allowed (reverting can only move toward the default).
+func seedPolicyDelete(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return seedErr(e, 401, "auth_required")
+	}
+	key := strings.TrimSpace(e.Request.URL.Query().Get("key"))
+	if key == "" {
+		key = seedPolicyKick
+	}
+	if !rxPolicyKey.MatchString(key) {
+		return seedErr(e, 400, "bad_key")
+	}
+	scope := strings.ToLower(strings.TrimSpace(e.Request.URL.Query().Get("scope")))
+	isSU := e.Auth.IsSuperuser()
+	if scope == "" {
+		if isSU {
+			scope = "global"
+		} else {
+			scope = "me"
+		}
+	}
+	if scope != "me" && scope != "global" {
+		return seedErr(e, 400, "bad_scope")
+	}
+	if scope == "global" && !isSU {
+		return seedErr(e, 403, "forbidden")
+	}
+	if scope == "me" && isSU {
+		return seedErr(e, 400, "bad_scope")
+	}
+	uid := ""
+	if scope == "me" {
+		uid = e.Auth.Id
+	}
+	r := findSetting(e.App, key, uid)
+	if r == nil {
+		return e.JSON(200, map[string]any{"ok": true, "deleted": 0})
+	}
+	if err := e.App.Delete(r); err != nil {
+		return seedErr(e, 500, "store_failed")
+	}
+	return e.JSON(200, map[string]any{"ok": true, "deleted": 1})
+}
+
+// ---------------------------------------------------------------- routes
+
+// gcSeedTable deletes expired rows (best-effort, capped batch). Challenges
+// live 5 minutes and used-nonce tombstones 24 hours — without this both
+// tables grow by one row per login attempt, forever.
+func gcSeedTable(app core.App, col string) {
+	cutoff := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := app.FindRecordsByFilter(col, "expires < '"+cutoff+"'", "", 500, 0)
+	if err != nil {
+		return
+	}
+	for _, r := range rows {
+		_ = app.Delete(r)
+	}
+}
+
+// POST /api/seed/challenge {public_key, purpose} -> {nonce, expires_in}
+func seedChallenge(e *core.RequestEvent) error {
+	gcSeedTable(e.App, "seed_challenges")
+	var b struct {
+		PublicKey string `json:"public_key"`
+		Purpose   string `json:"purpose"`
+	}
+	_ = e.BindBody(&b) // zero struct on failure, same as the JS readBody fallback
+
+	pk := strings.ToLower(b.PublicKey)
+	if !rxHex64.MatchString(pk) {
+		return seedErr(e, 400, "bad_public_key")
+	}
+	if b.Purpose != "login" && b.Purpose != "register" {
+		return seedErr(e, 400, "bad_purpose")
+	}
+
+	col, err := e.App.FindCollectionByNameOrId("seed_challenges")
+	if err != nil {
+		return seedErr(e, 500, "no_store")
+	}
+	rec := core.NewRecord(col)
+	rec.Set("public_key", pk)
+	rec.Set("nonce", security.RandomString(32))
+	rec.Set("purpose", b.Purpose)
+	rec.Set("used", false)
+	rec.Set("expires", time.Now().Add(seedChallengeTTL).UTC().Format(time.RFC3339Nano))
+	if err := e.App.Save(rec); err != nil {
+		return seedErr(e, 500, "store_failed")
+	}
+	return e.JSON(200, map[string]any{"nonce": rec.Get("nonce"), "expires_in": 300})
+}
+
+// POST /api/seed/login {public_key, signature, purpose, nonce, device_name}
+// -> {access, session_id, user_id, expires_in} + httpOnly pb_seed cookie
+func seedLogin(e *core.RequestEvent) error {
+	var b struct {
+		PublicKey  string `json:"public_key"`
+		Signature  string `json:"signature"`
+		Purpose    string `json:"purpose"`
+		Nonce      string `json:"nonce"`
+		DeviceName string `json:"device_name"`
+	}
+	_ = e.BindBody(&b)
+
+	pk := strings.ToLower(b.PublicKey)
+	sig := strings.ToLower(b.Signature)
+	if !rxHex64.MatchString(pk) {
+		return seedErr(e, 400, "bad_public_key")
+	}
+	if !rxHex128.MatchString(sig) {
+		return seedErr(e, 400, "bad_signature")
+	}
+	if b.Purpose != "login" && b.Purpose != "register" {
+		return seedErr(e, 400, "bad_purpose")
+	}
+
+	ch, err := e.App.FindFirstRecordByData("seed_challenges", "nonce", b.Nonce)
+	if err != nil || ch == nil ||
+		asStr(ch.Get("public_key")) != pk ||
+		asStr(ch.Get("purpose")) != b.Purpose {
+		return seedErr(e, 400, "no_challenge")
+	}
+	if asBool(ch.Get("used")) || isoExpired(ch.Get("expires")) {
+		return seedErr(e, 400, "no_challenge")
+	}
+
+	// Atomic one-shot: unique index on seed_used.nonce makes double-spend fail.
+	// Burned BEFORE verify (bad signature also burns the nonce).
+	usedCol, err := e.App.FindCollectionByNameOrId("seed_used")
+	if err != nil {
+		return seedErr(e, 500, "no_store")
+	}
+	used := core.NewRecord(usedCol)
+	used.Set("nonce", b.Nonce)
+	used.Set("expires", time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339Nano))
+	if err := e.App.Save(used); err != nil {
+		return seedErr(e, 400, "no_challenge")
+	}
+	gcSeedTable(e.App, "seed_used")
+	ch.Set("used", true)
+	_ = e.App.Save(ch) // housekeeping
+
+	msg := seedMsgPrefix + b.Purpose + ":" + pk + ":" + b.Nonce
+	pub, err1 := hex.DecodeString(pk)
+	sg, err2 := hex.DecodeString(sig)
+	if err1 != nil || err2 != nil || !ed25519.Verify(pub, []byte(msg), sg) {
+		return seedErr(e, 400, "bad_signature")
+	}
+
+	email := pk + "@seed.local"
+	user, err := e.App.FindFirstRecordByData("users", "email", email)
+	if b.Purpose == "register" {
+		if err == nil && user != nil {
+			return seedErr(e, 400, "already_registered")
+		}
+		ucol, err := e.App.FindCollectionByNameOrId("users")
+		if err != nil {
+			return seedErr(e, 500, "no_store")
+		}
+		user = core.NewRecord(ucol)
+		user.Set("email", email)
+		user.Set("password", security.RandomString(48))
+		user.Set("emailVisibility", false)
+		if err := e.App.Save(user); err != nil {
+			return seedErr(e, 500, "store_failed")
+		}
+	} else {
+		if err != nil || user == nil {
+			return seedErr(e, 404, "no_user")
+		}
+		if userBanned(user) {
+			return banErr(e, user)
+		}
+	}
+
+	ip := e.RealIP() // falls back to RemoteIP when no trusted proxy is configured
+	grant := security.RandomString(24)
+	secret := security.RandomString(32)
+
+	scol, err := e.App.FindCollectionByNameOrId("seed_sessions")
+	if err != nil {
+		return seedErr(e, 500, "no_store")
+	}
+	sess := core.NewRecord(scol)
+	sess.Set("user", user.Id)
+	sess.Set("grant_id", grant)
+	sess.Set("secret_hash", security.SHA256(secret))
+	sess.Set("device_name", truncRunes(b.DeviceName, 200))
+	if ip != "" {
+		adoptIP(sess, grant, ip)
+	} else {
+		sess.Set("ip_hash", "")
+		sess.Set("ip_masked", "")
+		sess.Set("ip_country", "")
+	}
+	sess.Set("history", []any{})
+	sess.Set("revoked", false)
+	sess.Set("last_seen", nowISO())
+	sess.Set("expires", time.Now().AddDate(0, 0, seedSessionDays).UTC().Format(time.RFC3339Nano))
+	if err := e.App.Save(sess); err != nil {
+		return seedErr(e, 500, "store_failed")
+	}
+
+	setSeedCookie(e, grant+"."+secret, seedSessionDays*86400)
+
+	access, err := user.NewAuthToken()
+	if err != nil {
+		return seedErr(e, 500, "token_failed")
+	}
+	return e.JSON(200, map[string]any{
+		"access":     access,
+		"session_id": grant,
+		"user_id":    user.Id,
+		"expires_in": seedAccessTTL,
+	})
+}
+
+// POST /api/seed/renew (pb_seed cookie) -> {access, expires_in}
+//
+// Mirrors the original AUTHENTICATE renew path: ban re-checked, socket IP
+// compared against the stored hash, country refreshed on every new token.
+// [spec] the kick policy is per-user (users.strict_ip), not global, and a
+// kick hard-revokes the session (the original only rejects while IPs differ).
+// [spec] the IP check runs on renew only, not on every request.
+func seedRenew(e *core.RequestEvent) error {
+	raw := cookieVal(e, seedCookieName)
+	parts := strings.SplitN(raw, ".", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return seedErr(e, 401, "no_session")
+	}
+	sess, err := e.App.FindFirstRecordByData("seed_sessions", "grant_id", parts[0])
+	if err != nil || sess == nil {
+		return seedErr(e, 401, "no_session")
+	}
+	if !security.Equal(asStr(sess.Get("secret_hash")), security.SHA256(parts[1])) {
+		return seedErr(e, 401, "no_session")
+	}
+	if asBool(sess.Get("revoked")) || isoExpired(sess.Get("expires")) {
+		return seedErr(e, 401, "revoked")
+	}
+	user, err := e.App.FindRecordById("users", asStr(sess.Get("user")))
+	if err != nil || user == nil {
+		return seedErr(e, 401, "no_user")
+	}
+	if userBanned(user) {
+		return banErr(e, user)
+	}
+
+	// --- IP check (socket IP cannot be spoofed; headers are ignored) ---
+	curIP := e.RealIP()
+	if curIP != "" {
+		stored := asStr(sess.Get("ip_hash"))
+		switch {
+		case stored == "":
+			// First IP record is adoption, not a change (no history, no kick).
+			adoptIP(sess, parts[0], curIP)
+		case !security.Equal(stored, security.SHA256(curIP+"|"+parts[0])):
+			// IP changed.
+			if kick, _ := seedPolicy(e.App, asStr(sess.Get("user")), seedPolicyKick); kick {
+				sess.Set("revoked", true)
+				_ = e.App.Save(sess)
+				return seedErr(e, 401, "ip_changed")
+			}
+			pushHistory(sess, map[string]any{
+				"event":        "ip_changed",
+				"prev_masked":  asStr(sess.Get("ip_masked")),
+				"prev_country": asStr(sess.Get("ip_country")),
+				"at":           nowISO(),
+			})
+			adoptIP(sess, parts[0], curIP)
+		default:
+			// Same IP: still refresh the country — the geo DB may have
+			// been updated since (original refreshes on new-token jti).
+			sess.Set("ip_country", geoCountry(curIP))
+		}
+	}
+
+	sess.Set("last_seen", nowISO())
+	_ = e.App.Save(sess)
+
+	access, err := user.NewAuthToken()
+	if err != nil {
+		return seedErr(e, 500, "token_failed")
+	}
+	return e.JSON(200, map[string]any{"access": access, "expires_in": seedAccessTTL})
+}
+
+// POST /api/seed/revoke {grant_id} (Bearer + live session cookie)
+func seedRevoke(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return seedErr(e, 401, "auth_required")
+	}
+	var b struct {
+		GrantID string `json:"grant_id"`
+	}
+	_ = e.BindBody(&b)
+
+	sess, err := e.App.FindFirstRecordByData("seed_sessions", "grant_id", b.GrantID)
+	if err != nil || sess == nil || asStr(sess.Get("user")) != e.Auth.Id {
+		return seedErr(e, 404, "no_session")
+	}
+	sess.Set("revoked", true)
+	if err := e.App.Save(sess); err != nil {
+		return seedErr(e, 500, "store_failed")
+	}
+	return e.JSON(200, map[string]any{"ok": true})
+}
+
+// POST /api/seed/logout (Bearer + live session cookie)
+// -> revokes the CURRENT session (from the cookie) and clears the cookie.
+// Best-effort revoke (missing grant is still {ok:true}); the endpoint
+// itself requires a live session, like everything behind the middleware.
+func seedLogout(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return seedErr(e, 401, "auth_required")
+	}
+	raw := cookieVal(e, seedCookieName)
+	if parts := strings.SplitN(raw, ".", 2); len(parts) == 2 && parts[0] != "" {
+		if sess, err := e.App.FindFirstRecordByData("seed_sessions", "grant_id", parts[0]); err == nil && sess != nil &&
+			asStr(sess.Get("user")) == e.Auth.Id {
+			sess.Set("revoked", true)
+			_ = e.App.Save(sess)
+		}
+	}
+	clearSeedCookie(e)
+	return e.JSON(200, map[string]any{"ok": true})
+}
+
+// POST /api/seed/logout-all (Bearer + live session cookie)
+// -> revokes ALL own sessions (original: logoutEverywhere) and clears the cookie.
+func seedLogoutAll(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return seedErr(e, 401, "auth_required")
+	}
+	rows, err := e.App.FindRecordsByFilter("seed_sessions", "user = '"+e.Auth.Id+"'", "", 1000, 0)
+	if err != nil {
+		return seedErr(e, 500, "store_failed")
+	}
+	n := 0
+	for _, s := range rows {
+		if asBool(s.Get("revoked")) {
+			continue
+		}
+		s.Set("revoked", true)
+		if err := e.App.Save(s); err == nil {
+			n++
+		}
+	}
+	clearSeedCookie(e)
+	return e.JSON(200, map[string]any{"ok": true, "revoked": n})
+}
+
+// GET /api/seed/sessions -> own sessions (masked, no raw IP anywhere)
+func seedSessions(e *core.RequestEvent) error {
+	if e.Auth == nil {
+		return seedErr(e, 401, "auth_required")
+	}
+	rows, err := e.App.FindRecordsByFilter("seed_sessions", "user = '"+e.Auth.Id+"'", "-created", 50, 0)
+	if err != nil {
+		rows, err = e.App.FindRecordsByFilter("seed_sessions", "user = '"+e.Auth.Id+"'", "", 50, 0)
+		if err != nil {
+			return seedErr(e, 500, "store_failed")
+		}
+	}
+	curGrant := ""
+	if parts := strings.SplitN(cookieVal(e, seedCookieName), ".", 2); len(parts) == 2 {
+		curGrant = parts[0]
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, s := range rows {
+		grant := asStr(s.Get("grant_id"))
+		out = append(out, map[string]any{
+			"session_id":  grant,
+			"device_name": asStr(s.Get("device_name")),
+			"ip_masked":   asStr(s.Get("ip_masked")),
+			"country":     asStr(s.Get("ip_country")),
+			"history":     getHistory(s),
+			"current":     curGrant != "" && curGrant == grant,
+			"revoked":     asBool(s.Get("revoked")),
+			"last_seen":   asStr(s.Get("last_seen")),
+			"created":     s.Get("created"),
+			"expires":     asStr(s.Get("expires")),
+		})
+	}
+	return e.JSON(200, out)
+}
+
+// ---------------------------------------------------------------- middleware
+
+// Session-binding middleware: users-token requests must carry a live session
+// cookie, and the profile must not be banned (original: AUTHENTICATE checks
+// disabled/block_until on login, renew AND data access).
+func seedSessionMiddleware(e *core.RequestEvent) error {
+	path := e.Request.URL.Path
+	for _, s := range []string{
+		"/api/seed/challenge",
+		"/api/seed/login",
+		"/api/seed/renew",
+		"/api/health",
+		"/api/_/",
+		"/api/collections/_superusers",
+		"/api/probe/",
+	} {
+		if strings.HasPrefix(path, s) {
+			return e.Next()
+		}
+	}
+
+	a := e.Auth
+	if a == nil {
+		return e.Next() // guest: API rules decide (public data stays public)
+	}
+	if a.IsSuperuser() {
+		return e.Next()
+	}
+
+	raw := cookieVal(e, seedCookieName)
+	parts := strings.SplitN(raw, ".", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return seedErr(e, 401, "session_required")
+	}
+	sess, err := e.App.FindFirstRecordByData("seed_sessions", "grant_id", parts[0])
+	if err != nil || sess == nil {
+		return seedErr(e, 401, "session_required")
+	}
+	if !security.Equal(asStr(sess.Get("secret_hash")), security.SHA256(parts[1])) {
+		return seedErr(e, 401, "session_required")
+	}
+	if asStr(sess.Get("user")) != a.Id {
+		return seedErr(e, 401, "session_required")
+	}
+	if asBool(sess.Get("revoked")) || isoExpired(sess.Get("expires")) {
+		return seedErr(e, 401, "session_revoked")
+	}
+	user, err := e.App.FindRecordById("users", a.Id)
+	if err != nil || user == nil {
+		return seedErr(e, 401, "no_user")
+	}
+	if userBanned(user) {
+		return banErr(e, user)
+	}
+	return e.Next()
+}
+
+// ---------------------------------------------------------------- users guard
+
+// protectUsersFields forbids non-superusers from changing identity and
+// moderation fields through the API. banned/ban_reason/banned_until are
+// admin-only; email is server-managed (it maps 1:1 to the seed public key).
+// (The personal kick-policy setting lives in seed_settings, not users.)
+func protectUsersFields(app core.App) {
+	protected := []string{"email", "banned", "ban_reason", "banned_until"}
+	app.OnRecordUpdateRequest("users").BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.Auth != nil && e.Auth.IsSuperuser() {
+			return e.Next()
+		}
+		orig, err := e.App.FindRecordById("users", e.Record.Id)
+		if err != nil || orig == nil {
+			return e.Next() // let PB answer 404
+		}
+		for _, f := range protected {
+			var same bool
+			if f == "banned" {
+				same = asBool(orig.Get(f)) == asBool(e.Record.Get(f))
+			} else {
+				same = asStr(orig.Get(f)) == asStr(e.Record.Get(f))
+			}
+			if !same {
+				return seedErr(e.RequestEvent, 403, "forbidden")
+			}
+		}
+		return e.Next()
+	})
+}
+
+// ---------------------------------------------------------------- bootstrap schema
+
+func autoDates(c *core.Collection) {
+	c.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
+	c.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
+}
+
+// ensureFields adds missing fields to an EXISTING collection (upgrade-safe:
+// already-deployed volumes gain new fields without touching stored data).
+func ensureFields(app core.App, colName string, fields ...core.Field) error {
+	col, err := app.FindCollectionByNameOrId(colName)
+	if err != nil {
+		return err
+	}
+	missing := false
+	for _, f := range fields {
+		if col.Fields.GetByName(f.GetName()) == nil {
+			col.Fields.Add(f)
+			missing = true
+		}
+	}
+	if !missing {
+		return nil
+	}
+	if err := app.Save(col); err != nil {
+		return err
+	}
+	app.Logger().Info("seed fields added", "collection", colName)
+	return nil
+}
+
+// ensureSeedSchema creates the seed collections on first boot (fresh volume)
+// and aligns the stock users collection with the repo scheme:
+// 15-minute access tokens, no password self-registration (seed is the only
+// registration path), moderation + strict-IP fields. Idempotent.
+func ensureSeedSchema(app core.App) error {
+	users, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		return err
+	}
+	touched := false
+	if users.AuthToken.Duration != seedAccessTTL {
+		users.AuthToken.Duration = seedAccessTTL
+		touched = true
+	}
+	if users.CreateRule != nil {
+		users.CreateRule = nil
+		touched = true
+	}
+	if touched {
+		if err := app.Save(users); err != nil {
+			return err
+		}
+	}
+	// Moderation fields (original: disabled/block_reason/block_until).
+	if err := ensureFields(app, "users",
+		&core.BoolField{Name: "banned"},
+		&core.TextField{Name: "ban_reason", Max: 255},
+		&core.TextField{Name: "banned_until", Max: 64},
+	); err != nil {
+		return err
+	}
+
+	builders := map[string]func(usersId string) *core.Collection{
+		"seed_challenges": func(_ string) *core.Collection {
+			c := core.NewBaseCollection("seed_challenges")
+			c.Fields.Add(
+				&core.TextField{Name: "public_key", Max: 64},
+				&core.TextField{Name: "nonce", Max: 64},
+				&core.TextField{Name: "purpose", Max: 16},
+				&core.BoolField{Name: "used"},
+				&core.TextField{Name: "expires", Max: 64},
+			)
+			autoDates(c)
+			return c
+		},
+		"seed_used": func(_ string) *core.Collection {
+			c := core.NewBaseCollection("seed_used")
+			c.Fields.Add(
+				&core.TextField{Name: "nonce", Max: 64},
+				&core.TextField{Name: "expires", Max: 64},
+			)
+			autoDates(c)
+			c.Indexes = types.JSONArray[string]{
+				"CREATE UNIQUE INDEX idx_seed_used_nonce ON seed_used (nonce)",
+			}
+			return c
+		},
+		"seed_sessions": func(usersId string) *core.Collection {
+			c := core.NewBaseCollection("seed_sessions")
+			c.Fields.Add(
+				&core.RelationField{Name: "user", CollectionId: usersId, MaxSelect: 1},
+				&core.TextField{Name: "grant_id", Max: 64},
+				&core.TextField{Name: "secret_hash", Max: 128},
+				&core.TextField{Name: "device_name", Max: 255},
+				&core.TextField{Name: "ip_hash", Max: 128},
+				&core.TextField{Name: "ip_masked", Max: 255},
+				&core.TextField{Name: "ip_country", Max: 8},
+				&core.JSONField{Name: "history"},
+				&core.BoolField{Name: "revoked"},
+				&core.TextField{Name: "last_seen", Max: 64},
+				&core.TextField{Name: "expires", Max: 64},
+			)
+			autoDates(c)
+			c.Indexes = types.JSONArray[string]{
+				"CREATE UNIQUE INDEX idx_seed_sessions_grant ON seed_sessions (grant_id)",
+			}
+			return c
+		},
+		"seed_settings": func(usersId string) *core.Collection {
+			// fss port (04_settings.surql): one row = one option.
+			// user empty = global default; user set = personal override.
+			// Partial unique indexes: SQLite treats NULLs as distinct, so
+			// (user,key) uniqueness needs two indexes, not one.
+			c := core.NewBaseCollection("seed_settings")
+			c.Fields.Add(
+				&core.TextField{Name: "key", Max: 64},
+				&core.BoolField{Name: "value"},
+				&core.RelationField{Name: "user", CollectionId: usersId, MaxSelect: 1},
+				&core.BoolField{Name: "locked"},
+			)
+			autoDates(c)
+			c.Indexes = types.JSONArray[string]{
+				"CREATE UNIQUE INDEX idx_seed_settings_personal ON seed_settings (user, key) WHERE user IS NOT NULL",
+				"CREATE UNIQUE INDEX idx_seed_settings_global ON seed_settings (key) WHERE user IS NULL",
+			}
+			return c
+		},
+		"notes": func(usersId string) *core.Collection {
+			c := core.NewBaseCollection("notes")
+			readRule := `visibility = "public" || owner = @request.auth.id`
+			c.ListRule = types.Pointer(readRule)
+			c.ViewRule = types.Pointer(readRule)
+			c.CreateRule = types.Pointer(`@request.auth.id != "" && @request.body.owner = @request.auth.id`)
+			c.UpdateRule = types.Pointer(`owner = @request.auth.id`)
+			c.DeleteRule = types.Pointer(`owner = @request.auth.id`)
+			c.Fields.Add(
+				&core.TextField{Name: "title", Max: 255},
+				&core.RelationField{Name: "owner", CollectionId: usersId, MaxSelect: 1},
+				&core.TextField{Name: "visibility", Max: 16},
+			)
+			autoDates(c)
+			return c
+		},
+	}
+
+	for name, build := range builders {
+		if _, err := app.FindCollectionByNameOrId(name); err == nil {
+			continue
+		}
+		if err := app.Save(build(users.Id)); err != nil {
+			return err
+		}
+		app.Logger().Info("seed collection created", "name", name)
+	}
+	// Upgrade path for volumes created before ip_country/history existed.
+	if err := ensureFields(app, "seed_sessions",
+		&core.TextField{Name: "ip_country", Max: 8},
+		&core.JSONField{Name: "history"},
+	); err != nil {
+		return err
+	}
+	// One-way migration (stage 1 -> fss model): users.strict_ip moves into
+	// seed_settings personal rows; the field is then dropped. Zero-loss.
+	if err := migrateStrictIP(app); err != nil {
+		return err
+	}
+	// Tombstone expiry for replay protection (upgrade path for seed_used
+	// rows created before GC existed — they carry no expires and are
+	// collected on the first pass).
+	if err := ensureFields(app, "seed_used",
+		&core.TextField{Name: "expires", Max: 64},
+	); err != nil {
+		return err
+	}
+	// Notes: owners can only create notes for themselves (upgrade path —
+	// creation-time rules don't touch existing collections).
+	if notes, err := app.FindCollectionByNameOrId("notes"); err == nil {
+		want := `@request.auth.id != "" && @request.body.owner = @request.auth.id`
+		if notes.CreateRule == nil || *notes.CreateRule != want {
+			notes.CreateRule = types.Pointer(want)
+			if err := app.Save(notes); err != nil {
+				return err
+			}
+			app.Logger().Info("seed notes rule tightened")
+		}
+	}
+	return ensureSeedSettings(app)
+}
+
+// ensureSeedSettings hardens fresh installs (never overrides admin config):
+// the real client IP from behind the PaaS proxy, plus flood protection on
+// the seed endpoints and the stock PB auth paths.
+func ensureSeedSettings(app core.App) error {
+	s := app.Settings()
+	changed := false
+	if len(s.TrustedProxy.Headers) == 0 {
+		// Northflank (Envoy) appends X-Forwarded-For; the rightmost entry is
+		// the client as seen by the last proxy — immune to client-prepended
+		// spoof values as long as every request arrives via the proxy.
+		// Direct/local requests carry no such header and fall back to the
+		// unspoofable socket IP (RemoteIP).
+		s.TrustedProxy.Headers = []string{"X-Forwarded-For"}
+		s.TrustedProxy.UseLeftmostIP = false
+		changed = true
+	}
+	if !s.RateLimits.Enabled {
+		s.RateLimits.Enabled = true
+		s.RateLimits.ExcludedIPs = []string{"127.0.0.1", "::1"}
+		s.RateLimits.Rules = []core.RateLimitRule{
+			{Label: "POST /api/seed/challenge", Audience: core.RateLimitRuleAudienceGuest, MaxRequests: 60, Duration: 60},
+			{Label: "POST /api/seed/login", Audience: core.RateLimitRuleAudienceGuest, MaxRequests: 60, Duration: 60},
+			{Label: "POST /api/seed/renew", MaxRequests: 120, Duration: 60},
+			{Label: "*:auth", MaxRequests: 2, Duration: 3},
+			{Label: "*:create", MaxRequests: 20, Duration: 5},
+			{Label: "/api/batch", MaxRequests: 3, Duration: 1},
+			{Label: "/api/", MaxRequests: 300, Duration: 10},
+		}
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return app.Save(s)
+}
+
+func migrateStrictIP(app core.App) error {
+	users, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		return err
+	}
+	if users.Fields.GetByName("strict_ip") == nil {
+		return nil // already migrated (or never had it)
+	}
+	rows, err := app.FindRecordsByFilter("users", "strict_ip = true", "", 10000, 0)
+	if err != nil {
+		return err
+	}
+	for _, u := range rows {
+		if findSetting(app, seedPolicyKick, u.Id) != nil {
+			continue
+		}
+		col, err := app.FindCollectionByNameOrId("seed_settings")
+		if err != nil {
+			return err
+		}
+		rec := core.NewRecord(col)
+		rec.Set("key", seedPolicyKick)
+		rec.Set("value", true)
+		rec.Set("user", u.Id)
+		rec.Set("locked", false)
+		if err := app.Save(rec); err != nil {
+			return err
+		}
+	}
+	users.Fields.RemoveByName("strict_ip")
+	if err := app.Save(users); err != nil {
+		return err
+	}
+	app.Logger().Info("seed migration done", "strict_ip_moved", len(rows))
+	return nil
+}
+
+// ensureSuperuserFromEnv creates the first superuser from env on fresh
+// installs (PaaS-friendly: no interactive setup). Never overwrites an
+// existing superuser, never fails the boot.
+func ensureSuperuserFromEnv(app core.App) {
+	email := strings.TrimSpace(os.Getenv("PB_SUPERUSER_EMAIL"))
+	pass := os.Getenv("PB_SUPERUSER_PASSWORD")
+	if email == "" || pass == "" {
+		return
+	}
+	if _, err := app.FindFirstRecordByData("_superusers", "email", email); err == nil {
+		app.Logger().Info("superuser already exists, env bootstrap skipped", "email", email)
+		return
+	}
+	col, err := app.FindCollectionByNameOrId("_superusers")
+	if err != nil {
+		app.Logger().Error("superuser env bootstrap failed", "error", err)
+		return
+	}
+	rec := core.NewRecord(col)
+	rec.Set("email", email)
+	rec.Set("password", pass)
+	if err := app.Save(rec); err != nil {
+		app.Logger().Error("superuser env bootstrap failed (password min 8 chars?)", "error", err)
+		return
+	}
+	app.Logger().Info("superuser created from env", "email", email)
+}
